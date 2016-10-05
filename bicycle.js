@@ -107,17 +107,6 @@ var bicycle = (function () {
             monitor.drop(eventName);
         };
 
-        this.sendRequest = function (callback, data, url, method, json) {
-            EVENT_BUS.throwEvent(new Event(EVENTS.PAGE_EDITOR_MODEL.PEM_SEND_REQUEST, {
-                    data: data,
-                    url: url,
-                    method: method,
-                    callback: callback,
-                    json: G.isNotUndefAndNull(json) ? json : false
-                }
-            ));
-        };
-
         var ViewRequest = function (_viewName) {
             var viewName = _viewName;
             var viewModel;
@@ -143,20 +132,29 @@ var bicycle = (function () {
             return new ViewRequest(viewName);
         };
 
-        this.processTemplate = function (templateKey, viewObject) {
-            return TP.processTemplate(templateKey, viewObject);
-        };
-
         // views
         this.renderView = function (_$containerSelector, templateUrl, model, _eventBinder, viewScope) {
+
             var eventBinder = _eventBinder || function () {
                 };
+
             if ($(_$containerSelector) && $(_$containerSelector).length > 0) {
-                $(_$containerSelector).append(self.processTemplate(templateUrl, model));
-                var viewElementSelectors = TP.viewElementSelectors(templateUrl);
-                var viewElementFunctionsClick = TP.viewElementFunctionsClick(templateUrl);
+
+                var templateProcessorResult = TP.processTemplate(templateUrl, model);
+
+                // append rendered view content to specified view contatiner
+                $(_$containerSelector).append(templateProcessorResult.template);
+
+                // ensure view scope
                 viewScope = viewScope || {};
-                var postBindings = extendViewScope(viewScope, viewElementSelectors, viewElementFunctionsClick);
+
+                var postBindings = extendViewScope(
+                    viewScope,
+                    templateProcessorResult.viewElementSelectors,
+                    templateProcessorResult.viewElementFunctions,
+                    templateProcessorResult.viewElementOnFunctions
+                );
+
                 if (_show_debug_info) {
                     console.log("EVENT BINDER`s call: ---------------------------------------");
                     console.log(templateUrl);
@@ -174,7 +172,7 @@ var bicycle = (function () {
         };
 
 
-        var extendViewScope = function (viewScope, viewElementSelectors, viewElementFunctionsClick) {
+        var extendViewScope = function (viewScope, viewElementSelectors, viewElementFunctions, viewElementOnFunctions) {
             var postBindingFuncs = {};
             var count = 0;
 
@@ -186,21 +184,37 @@ var bicycle = (function () {
                     viewScope[elementKey] = $(viewElementSelectors[elementKey]);
                 }
             }
-            for (elementKey in viewElementFunctionsClick) {
-                if (!viewElementFunctionsClick.hasOwnProperty(elementKey))continue;
+            for (elementKey in viewElementFunctions) {
+                if (!viewElementFunctions.hasOwnProperty(elementKey))continue;
                 var scopeHandler = viewScope[elementKey];
                 if (scopeHandler) {
-                    $.each(viewElementFunctionsClick[elementKey], function (index) {
-                        var element = $(viewElementFunctionsClick[elementKey][index]);
+                    $.each(viewElementFunctions[elementKey], function (index) {
+                        var element = $(viewElementFunctions[elementKey][index]);
                         if (element.length > 0) {
                             element.on('click', viewScope[elementKey]);
                         }
                     });
                 } else {
                     count++;
-                    postBindingFuncs[elementKey] = viewElementFunctionsClick[elementKey];
+                    postBindingFuncs[elementKey] = viewElementFunctions[elementKey];
                 }
             }
+
+            for (elementKey in viewElementOnFunctions) {
+                if (!viewElementOnFunctions.hasOwnProperty(elementKey))continue;
+
+                var events = viewElementOnFunctions[elementKey];
+
+                var func = bc.fetchFunction(elementKey);
+
+                $.each(events, function (index) {
+                    var event = events[index];
+                    if (event["ONRENDER"] !== undefined) {
+                        func($(event["ONRENDER"]));
+                    }
+                });
+            }
+
             return {
                 postBinding: postBindingFuncs,
                 size: count
@@ -225,15 +239,14 @@ var bicycle = (function () {
         return this;
     };
 
+    // Stateful. It`s creating on start of application.
+    // Stores templates
     var TemplateProcessor = function (_appStartEventName) {
 
         var self = this;
         var templateUrls;
         var templates = {};
         var functions = {};
-
-        var templatesElementSelectors = {};
-        var templatesElementFunctionsClick = {};
 
         var init = function () {
             self.on(_appStartEventName, handleAppStart);
@@ -249,11 +262,8 @@ var bicycle = (function () {
                 var url = templateUrls[key];
                 $.ajax({
                     url: url,
-                    success: function (data) {
-                        var preprocessed = preProcessBCAttributes(data, url);
-                        templatesElementSelectors[url] = preprocessed.viewElementSelectors;
-                        templatesElementFunctionsClick[url] = preprocessed.viewElementFunctionsClick;
-                        templates[url] = doT.template(preprocessed.template);
+                    success: function (viewTemplateContent) {
+                        templates[url] = doT.template(removeComments(viewTemplateContent));
                         countLoaded++;
                         if (countFact == countLoaded) {
                             bc.trigger(Events._APP._Loaded);
@@ -263,16 +273,21 @@ var bicycle = (function () {
             });
         };
 
-        var preProcessBCAttributes = function (data, url) {
 
-            data = data.replace(/\<\!\-\-.*?\-\-\>/gi, "");
+        var removeComments = function (_html) {
+            return _html.replace(/\<\!\-\-.*?\-\-\>/gi, "");
+        };
 
-            var bcJQContainer = data.match(/bc\-jq\-container\=\".*?\"/gi);
-            var bcQJElements = data.match(/bc\-jq-el=\".*?\"/gi);
-            var bcQJFunc = data.match(/bc\-jq\-click=\".*?\"/gi);
+        var preProcessBCAttributes = function (_data) {
+
+            var bcJQContainer = _data.match(/bc\-jq\-container\=\".*?\"/gi);
+            var bcQJElements = _data.match(/bc\-jq-el=\".*?\"/gi);
+            var bcQJFunc = _data.match(/bc\-jq\-click=\".*?\"/gi);
+            var bcOnFunc = _data.match(/bc\-on.*?=\".*?\"/gi);
 
             var viewElementSelectors = {};
-            var viewElementFunctionsClick = {};
+            var viewElementFunctions = {};
+            var viewElementOnFunctions = {};
 
             if (bcJQContainer != null && bcJQContainer.length > 0) {
                 var containerSelector = bcJQContainer[0]
@@ -300,23 +315,60 @@ var bicycle = (function () {
                             .replace(/bc\-jq-click=\"/, "")
                             .replace(/\(\)/, "")
                             .split(" ");
-                        if (!viewElementFunctionsClick[current[1]]) {
-                            viewElementFunctionsClick[current[1]] = [containerSelector + current[0]];
+                        if (!viewElementFunctions[current[1]]) {
+                            viewElementFunctions[current[1]] = [containerSelector + current[0]];
                         } else {
-                            viewElementFunctionsClick[current[1]].push(containerSelector + current[0]);
+                            viewElementFunctions[current[1]].push(containerSelector + current[0]);
                         }
                     });
                 }
+
+                if (bcOnFunc != null) {
+                    $.each(bcOnFunc, function (index) {
+
+                        var current = bcOnFunc[index];
+                        var extractResult = extractOnMethod(current)
+
+                        var onMethod = extractResult.onMethod.replace(/[-,_]/gi, "").toUpperCase();
+
+                        var element = {};
+
+                        element[onMethod] = containerSelector + extractResult.selector;
+
+                        if (!viewElementOnFunctions[extractResult.functionName]) {
+                            viewElementOnFunctions[extractResult.functionName] = [element];
+                        } else {
+                            viewElementOnFunctions[extractResult.functionName].push(element);
+                        }
+                    });
+                }
+
+                function extractOnMethod(currentBcDeclaration) {
+                    var result = currentBcDeclaration.substr("bc-".length);
+                    var onMethodNameLength = result.indexOf('="');
+
+                    var elements = result
+                        .substr(onMethodNameLength + 2, result.length - onMethodNameLength - 3)
+                        .split(" ");
+
+                    return {
+                        "onMethod": result.substr(0, onMethodNameLength),
+                        "selector": elements[0],
+                        "functionName": elements[1]
+                    };
+                }
             }
 
-            var template = data
+            var template = _data
                 .replace(/bc\-jq\-container\=\".*?\"/gi, "")
                 .replace(/bc\-jq-el=\".*?\"/gi, "")
-                .replace(/bc\-jq\-click=\".*?\"/gi, "");
+                .replace(/bc\-jq\-click=\".*?\"/gi, "")
+                .replace(/bc\-on.*?=\".*?\"/gi, "");
 
             return {
                 viewElementSelectors: viewElementSelectors,
-                viewElementFunctionsClick: viewElementFunctionsClick,
+                viewElementFunctions: viewElementFunctions,
+                viewElementOnFunctions: viewElementOnFunctions,
                 template: template
             };
         };
@@ -387,16 +439,15 @@ var bicycle = (function () {
 
         this.processTemplate = function (templateKey, viewModel) {
             var result = templates[templateKey];
-            return postProcess(result(viewModel), viewModel);
+
+            var htmlToBeRendered = result(viewModel);
+
+            var preprocessed = preProcessBCAttributes(htmlToBeRendered);
+            preprocessed.template = postProcess(preprocessed.template, viewModel);
+
+            return preprocessed;
         };
 
-        this.viewElementSelectors = function (templateKey) {
-            return templatesElementSelectors[templateKey];
-        };
-
-        this.viewElementFunctionsClick = function (templateKey) {
-            return templatesElementFunctionsClick[templateKey];
-        };
 
         init();
         return this;
@@ -408,8 +459,9 @@ var bicycle = (function () {
     document.templateProcessor = new TemplateProcessor(Events._APP._START);
     var TP = document.templateProcessor;
 
+
     /**
-     * this is interface of this library
+     * This is interface of this library
      *
      * @constructor
      */
@@ -456,6 +508,18 @@ var bicycle = (function () {
             } else {
                 console.error("name of function can not be empty");
             }
+        };
+
+        this.fetchFunction = function (name) {
+            var func;
+            if (name === "") {
+                console.error("name of function can not be empty");
+            }
+            func = functions[name.replace(/[\(,\)]/gi, "")];
+            if (func == undefined) {
+                console.error("function " + name + " is not found");
+            }
+            return func;
         };
 
         this.createComponent = function (name, component) {
@@ -571,10 +635,6 @@ var bicycle = (function () {
             if (monitoringRequired == undefined || monitoringRequired == true) {
                 monitor.check(eventName, args);
             }
-        };
-
-        this.processTemplate = function (templateKey, viewObject) {
-            return TP.processTemplate(templateKey, viewObject);
         };
 
         var setComponentName = function (component, name) {
